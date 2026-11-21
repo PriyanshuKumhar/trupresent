@@ -1,0 +1,170 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwnerProfessor(classId) {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/classes/$(classId)).data.professorUid == request.auth.uid;
+    }
+
+    // All the logic for whether a given attendance write is legitimate.
+    function canMarkAttendance(sessionId, studentUid, data) {
+      let session = get(/databases/$(database)/documents/sessions/$(sessionId)).data;
+      let classDoc = get(/databases/$(database)/documents/classes/$(session.classId)).data;
+      let roster = get(/databases/$(database)/documents/classes/$(session.classId)/roster/$(data.rollNumber)).data;
+
+      return request.auth.uid == studentUid
+        && session.status == 'active'
+        && data.tokenUsed == session.currentToken
+        && request.time < session.tokenIssuedAt + duration.value(20, 's')
+        && roster.linkedUid == request.auth.uid
+        && data.lat is number
+        && data.lng is number
+        && data.lat >= classDoc.classLat - classDoc.maxLatDelta
+        && data.lat <= classDoc.classLat + classDoc.maxLatDelta
+        && data.lng >= classDoc.classLng - classDoc.maxLngDelta
+        && data.lng <= classDoc.classLng + classDoc.maxLngDelta;
+    }
+
+    // ---------- professors ----------
+    match /professors/{professorUid} {
+      allow read: if isSignedIn() && request.auth.uid == professorUid;
+      allow create: if isSignedIn() && request.auth.uid == professorUid
+                    && request.resource.data.mobileNumber is string
+                    && request.resource.data.mobileNumber.size() > 5;
+      allow update, delete: if false;
+    }
+
+    // ---------- students ----------
+    match /students/{studentUid} {
+      allow read: if isSignedIn() && request.auth.uid == studentUid;
+      allow create: if isSignedIn() && request.auth.uid == studentUid
+                    && request.resource.data.mobileNumber is string
+                    && request.resource.data.mobileNumber.size() > 5
+                    && request.resource.data.rollNumber is string
+                    && request.resource.data.rollNumber.size() > 0;
+      allow update, delete: if false;
+
+      // A student's own tamper-proof attendance history/"proof" log.
+      // The key line is the "create" rule: it only succeeds if the REAL,
+      // security-checked attendance document for this exact session
+      // already exists. A student can never write a fake "I was present"
+      // entry here, because exists() checks the actual sessions/.../
+      // attendance doc, which itself can only exist if canMarkAttendance()
+      // passed at the time it was created.
+      match /myAttendance/{sessionId} {
+        allow read: if isSignedIn() && request.auth.uid == studentUid;
+        allow create: if isSignedIn() && (
+          (request.auth.uid == studentUid && exists(/databases/$(database)/documents/sessions/$(sessionId)/attendance/$(studentUid))) ||
+          isOwnerProfessor(get(/databases/$(database)/documents/sessions/$(sessionId)).data.classId)
+        );
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- classes ----------
+    match /classes/{classId} {
+      // Fetching ONE class by its exact ID is allowed for any signed-in
+      // user — a student needs this during the "join class" flow. But
+      // QUERYING/listing classes (e.g. "give me every class in the app")
+      // is restricted to the owning professor, so students can't browse.
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && resource.data.professorUid == request.auth.uid;
+
+      allow create: if isSignedIn() && request.resource.data.professorUid == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.professorUid == request.auth.uid;
+
+      // Delete is allowed at the rule level for the owning professor, but
+      // the APP only ever offers a delete button for classes that have
+      // never run a session — otherwise it offers "Archive" instead.
+      // This is a client-side safety rail, not a server-enforced one:
+      // Firestore rules can't check "does any session reference this
+      // class" (that needs a collection query, which rules can't express
+      // against another collection). Deleting a class with real session/
+      // attendance history would orphan that data, not erase it — so the
+      // UI is what actually protects against that, not this rule.
+      allow delete: if isSignedIn() && resource.data.professorUid == request.auth.uid;
+
+      match /roster/{rollNumber} {
+        allow read: if isOwnerProfessor(classId) || resource.data.linkedUid == request.auth.uid;
+        allow create: if isOwnerProfessor(classId);
+
+        // Two different update paths, combined with OR:
+        allow update: if
+          // (1) Claiming: a signed-in student may claim an UNCLAIMED row
+          // as themselves, one time only — AND only if the mobile number
+          // they registered with matches the mobile number the professor
+          // uploaded for this exact roll number. This is what actually
+          // stops a student from claiming someone ELSE'S roll number: a
+          // roll number alone is often guessable (sequential, printed on
+          // notice boards), but a classmate's exact registered phone
+          // number generally isn't.
+          (isSignedIn()
+            && resource.data.linkedUid == null
+            && request.resource.data.linkedUid == request.auth.uid
+            && get(/databases/$(database)/documents/students/$(request.auth.uid)).data.mobileNumber == resource.data.mobileNumber
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['linkedUid', 'linkedAt']))
+          ||
+          // (2) The owning professor correcting a roster row's own details
+          // (e.g. a typo in the name or mobile number). Deliberately can
+          // NEVER touch linkedUid/linkedAt through this path — only the
+          // claim path above can do that.
+          (isOwnerProfessor(classId)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'mobileNumber']));
+
+        // A professor may remove a roster row only while it's still
+        // unclaimed — once a student has linked to it, deleting it would
+        // orphan their claims doc and any attendance history tied to
+        // that roll number.
+        allow delete: if isOwnerProfessor(classId) && resource.data.linkedUid == null;
+      }
+
+      // One claims doc per student per class — guarantees a single
+      // student can never hold more than one roll number in one class.
+      match /claims/{studentUid} {
+        allow read: if isSignedIn() && (
+          request.auth.uid == studentUid ||
+          resource.data.studentUid == request.auth.uid ||
+          isOwnerProfessor(classId)
+        );
+        allow create: if isSignedIn() && request.auth.uid == studentUid
+                      && request.resource.data.studentUid == request.auth.uid
+                      && request.resource.data.rollNumber is string;
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- sessions ----------
+    match /sessions/{sessionId} {
+      // SECURITY ENHANCEMENT: Restrict session read access strictly to the
+      // owning professor. Students obtain rotating tokens visually through the
+      // camera scanner from the projector, blocking remote eavesdropping on tokens.
+      allow get, list: if isSignedIn() && resource.data.professorUid == request.auth.uid;
+
+      allow create: if isSignedIn()
+                    && request.resource.data.professorUid == request.auth.uid
+                    && isOwnerProfessor(request.resource.data.classId);
+      allow update: if isSignedIn()
+                    && request.auth.uid == resource.data.professorUid;
+      allow delete: if false;
+
+      match /attendance/{studentUid} {
+        allow read: if isSignedIn() && (
+          request.auth.uid == studentUid ||
+          isOwnerProfessor(get(/databases/$(database)/documents/sessions/$(sessionId)).data.classId)
+        );
+        allow create: if isSignedIn() && (
+          canMarkAttendance(sessionId, studentUid, request.resource.data) ||
+          isOwnerProfessor(get(/databases/$(database)/documents/sessions/$(sessionId)).data.classId)
+        );
+        allow update, delete: if false;
+      }
+    }
+  }
+}
